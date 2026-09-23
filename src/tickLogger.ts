@@ -25,9 +25,9 @@ export class TickLogger {
     this.writer.seedLastKeyFromFile(date);
   }
 
-  append(tick: QuoteTick): void {
+  append(tick: QuoteTick): boolean {
     const date = new Date(tick.ts).toISOString().slice(0, 10);
-    this.writer.append(date, `${tick.ts}`, [
+    return this.writer.append(date, `${tick.ts}`, [
       new Date(tick.ts).toISOString(), // full ISO with ms
       tick.direction,
       tick.inAmount,

@@ -85,7 +85,7 @@ async function main(): Promise<void> {
 
   async function writeMinuteBar(bar: Bar): Promise<void> {
     const ts = formatMinuteBucket(bar.bucketStart);
-    writers.minute.append(formatUtcDate(bar.bucketStart), ts, [
+    const ok = writers.minute.append(formatUtcDate(bar.bucketStart), ts, [
       ts,
       bar.open,
       bar.high,
@@ -94,12 +94,13 @@ async function main(): Promise<void> {
       bar.sellClose,
       String(bar.ticks),
     ]);
+    if (!ok) log.warn("minute bar refused by monotonic guard — row dropped", { ts });
     await writers.minute.drain(); // flush per bar, like daily bars (review round 1)
   }
 
   async function writeDailyBar(bar: Bar): Promise<void> {
     const date = formatUtcDate(bar.bucketStart);
-    writers.daily.append(date, date, [
+    const ok = writers.daily.append(date, date, [
       date,
       bar.open,
       bar.high,
@@ -108,6 +109,7 @@ async function main(): Promise<void> {
       bar.sellClose,
       String(bar.ticks),
     ]);
+    if (!ok) log.warn("daily bar refused by monotonic guard — row dropped", { date });
     await writers.daily.drain();
   }
 
@@ -118,11 +120,18 @@ async function main(): Promise<void> {
 
   function ingest(tick: QuoteTick): void {
     aggregator.push(tick);
-    writers.ticks.append(tick);
+    if (!writers.ticks.append(tick)) {
+      log.warn("tick refused by monotonic guard — row dropped", { ts: tick.ts });
+    }
     health.lastTickAt = tick.ts;
   }
 
   // --- Startup smoke test (plan §3.5) ---------------------------------------
+  // rolloverTimer is declared with let (not const) BEFORE the smoke test:
+  // the smoke-failure path calls stop(1), which clears it — a later-declared
+  // const would TDZ-throw inside stop() and turn a clean exit into a crash
+  // (review round 2, P2).
+  let rolloverTimer: NodeJS.Timeout | undefined;
   const client = new JupiterClient(cfg.JUP_API, log);
   try {
     const smoke = await client.smokeTest();
@@ -196,7 +205,7 @@ async function main(): Promise<void> {
   }
 
   // 1-second rollover timer: primary bar emission driver (plan §4).
-  const rolloverTimer = setInterval(() => {
+  rolloverTimer = setInterval(() => {
     aggregator.emitDue(Date.now());
     flushGapWarnings();
   }, ROLLOVER_TIMER_MS);

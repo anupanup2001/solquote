@@ -229,7 +229,7 @@ services:
 2. Finalize in-progress bars? **No** — a partial bar is *not* emitted (it never closed); only already-completed bars are on disk. This matches gap semantics (§4): a crash mid-minute forfeits that partial minute's row (≤1 min). Note: with the 1-second emission timer (§4), any bar for a fully-elapsed minute was flushed ≤1 s after it closed — the shutdown loss window is only the in-progress minute, never a completed one.
 3. `await` writer flush/close (`stream.end()` + `finished`).
 4. Close health server. `process.exit(0)`.
-Jittered poll loop and in-flight fetch are aborted via the same shutdown flag + `AbortController`.
+The poll loop checks the shutdown flag between phases (buy → stagger → sell); in-flight fetches are bounded by the per-request 5 s `AbortSignal.timeout`, so shutdown never waits more than one request phase.
 
 ## 8. Test plan (vitest, minimal)
 
