@@ -8,7 +8,7 @@ Headless TypeScript service that polls the Jupiter Swap API V2 every 5 seconds f
 - Poll Jupiter Swap API V2 (`GET /swap/v2/order`, quote-only mode) every 5 s in **both directions**: SOL→USDC (buy price) and USDC→SOL (sell price).
 - Aggregate ticks into **1-minute OHLC bars** (file rotates daily at UTC midnight) and **daily OHLC bars** (single appended file), UTC everywhere.
 - Write provenance-rich **raw tick CSV** (one row per successful quote, both directions).
-- Flush per bar, handle gaps honestly (no synthetic rows), resume cleanly across restarts.
+- Flush per bar, handle gaps honestly (no synthetic rows); in-progress-bar resume intentionally unsupported (crash mid-minute forfeits that partial minute — gap semantics, tick CSV keeps provenance).
 - Ship as a Docker image; CSVs land in a mounted volume; tiny HTTP health endpoint.
 
 ### Non-goals
@@ -116,15 +116,13 @@ Before the loop starts: one real SOL→USDC quote. Log the derived price. Any no
 - **Rollover (timer-driven, primary)**: a 1-second wall-clock timer (`setInterval`, 1 s) checks whether the current minute bucket has changed; when it has (or when the UTC date rolls over), it emits the current bar(s) to the writer. Tick-driven rollover remains as a fallback (if a tick with a newer bucket arrives first, the bar is emitted then). Rationale: emission must not depend on the *next* tick arriving — if the API goes down at 14:07:30, the 14:07 bar (already holding real ticks) is still flushed within ≤1 s instead of being lost forever. Same timer closes the daily bar at 00:00:00Z.
 - **Gaps**: buckets with zero successful ticks produce **no CSV row** (locked decision 5). A warn is logged with the number of skipped minutes. Same semantics for the daily file (a fully-down day produces no row).
 - **Rotation**: 1-min writer rotates when the bar's UTC date changes → close current file, open `ohlc-1m-<newDate>.csv`, write header if file is new.
-- **Restart recovery** (in-progress bars):
-  1. On boot, find today's `ohlc-1m-<today>.csv` in `CSV_DIR`. If present, read the **last row** (cheap: read last ~4 KB, split lines).
-     - If the last row's `ts` == current minute bucket → resume that bar: `open/high/low` from the row, `close = open`, `ticks = 0` (ticks count restarts; acceptable and documented) — subsequent ticks in this minute extend it correctly.
-     - Else → no in-progress bar; next tick starts fresh.
-  2. For the daily bar: read the last row of `ohlc-1d.csv`. If its `date` == today → resume today's daily bar the same way. If the last row's date is older and **today's date > last row date**: no daily row was written for missing days — that is correct gap behavior (do not backfill).
-  3. Tick file is append-only; no recovery needed.
-  - Note: this only resumes the *current* minute/day. Because bars are now emitted on the 1-second timer (not the next tick), a bar for a completed minute is on disk within ~1 s of that minute ending — the only loss window is a crash inside that 1 s (≤1 partial bar, matching gap semantics). If the process was down across a boundary, the previous boundary bar was already flushed before the crash in the normal path; if it crashed mid-write, the CSV may end with a partial line — the writer mitigates by writing complete lines only (see §5) and recovery skips a trailing partial line (no trailing `\n` → discard).
-- **Resume of `sell_close`**: when resuming a 1-min bar, also restore `sell_close` from the resumed row's `sell_close` column; subsequent sell ticks overwrite it as normal.
-- **Monotonic guard**: ticks whose bucket ≤ the last *emitted* bar's bucket are discarded with a warn log (protects against NTP clock steps backward). Writers additionally refuse to append a `ts`/`date` ≤ the last row's — the last-row value is tracked in memory after recovery.
+- **Restart behavior (no in-progress resume — owner decision, review round 1)**:
+  On boot, writers seed their monotonic high-water mark from the last existing row's `ts`/`date` (cheap: last ~4 KB via `readLastRow`) purely so an append can **never duplicate** a row already persisted before the restart. One boot log line states that in-progress-bar resume is intentionally unsupported.
+  - **Loss window**: fully-elapsed minutes are on disk within ~1 s of their close (timer emission), so a crash at most forfeits the *current partial minute's* OHLC row (≤1 min of bar data, matching gap semantics — no synthetic backfill). Raw tick CSV keeps full provenance for the forfeited minute.
+  - Missing days in `ohlc-1d.csv` are correct gap behavior (do not backfill).
+  - Tick file is append-only; the same high-water-mark seeding applies.
+  - If the process crashed mid-write, the CSV may end with a partial line — the writer writes complete lines only (see §5) and `readLastRow` discards a trailing partial line (no trailing `\n`).
+- **Monotonic guard**: ticks whose bucket ≤ the last *emitted* bar's bucket, or whose bucket is before the currently *open* bar's bucket, are discarded with a warn log (protects against NTP clock steps backward). Writers additionally refuse to append a `ts`/`date` ≤ the last row's — the last-row value is seeded from disk at boot (high-water mark).
 
 ## 5. CSV formats & files
 
@@ -228,7 +226,7 @@ services:
 
 **Graceful shutdown sequence** (`SIGTERM`/`SIGINT`):
 1. Stop the poll loop (no new ticks).
-2. Finalize in-progress bars? **No** — a partial bar is *not* emitted (it never closed); only already-completed bars are on disk. This matches gap semantics: a killed minute = partial data = still extended on resume (§4). Note: with the 1-second emission timer (§4), any bar for a fully-elapsed minute was flushed ≤1 s after it closed — the shutdown loss window is only the in-progress second, not the whole partial bar.
+2. Finalize in-progress bars? **No** — a partial bar is *not* emitted (it never closed); only already-completed bars are on disk. This matches gap semantics (§4): a crash mid-minute forfeits that partial minute's row (≤1 min). Note: with the 1-second emission timer (§4), any bar for a fully-elapsed minute was flushed ≤1 s after it closed — the shutdown loss window is only the in-progress minute, never a completed one.
 3. `await` writer flush/close (`stream.end()` + `finished`).
 4. Close health server. `process.exit(0)`.
 Jittered poll loop and in-flight fetch are aborted via the same shutdown flag + `AbortController`.

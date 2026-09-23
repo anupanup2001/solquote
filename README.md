@@ -56,6 +56,7 @@ Notes:
 - `open/high/low/close` track the **buy** series (SOL→USDC); `sell_close` is the last USDC→SOL price in the bucket (empty if none).
 - Minutes/days with zero successful ticks produce **no row** (honest gaps).
 - Prices are fixed 6-decimal strings, truncated (never rounded).
+- **Restarts**: in-progress-bar resume is intentionally unsupported — a crash mid-minute forfeits that partial minute's OHLC row (raw tick CSV keeps provenance); restarts never duplicate already-persisted rows (monotonic high-water mark).
 
 ## Health
 

@@ -1,6 +1,7 @@
 /**
- * Wiring (plan §2/§7): restart recovery, staggered jittered poll loop,
- * 1-second rollover timer, CSV writers, health server, graceful shutdown.
+ * Wiring (plan §2/§7): monotonic high-water-mark seeding, staggered
+ * cadence-anchored poll loop, 1-second rollover timer, CSV writers,
+ * health server, graceful shutdown.
  */
 import { loadConfig, createLogger } from "./config.js";
 import {
@@ -12,13 +13,11 @@ import {
 import type { QuoteTick } from "./jupiter.js";
 import {
   OhlcAggregator,
-  floorTsToMinute,
-  floorTsToDay,
   formatMinuteBucket,
   formatUtcDate,
 } from "./ohlc.js";
 import type { Bar } from "./ohlc.js";
-import { CsvWriter, readLastRow } from "./csvWriter.js";
+import { CsvWriter } from "./csvWriter.js";
 import { TickLogger } from "./tickLogger.js";
 import { startHealthServer } from "./health.js";
 
@@ -62,59 +61,29 @@ async function main(): Promise<void> {
     ticks: new TickLogger(cfg.CSV_DIR),
   };
 
-  // --- Restart recovery (plan §4) -------------------------------------------
-  const bootTs = Date.now();
-  const bootDate = formatUtcDate(bootTs);
-  const bootMinuteBucket = formatMinuteBucket(floorTsToMinute(bootTs));
+  // --- Boot: monotonic high-water mark (plan §4, review round 1) -------------
+  // In-progress-bar resume is intentionally unsupported (owner decision,
+  // review round 1): a crash mid-minute forfeits that minute's partial OHLC
+  // row (gap semantics; raw tick CSV keeps full provenance). Writers only
+  // seed their last written key so appends can never duplicate a persisted
+  // row after a restart.
+  const bootDate = formatUtcDate(Date.now());
   writers.minute.seedLastKeyFromFile(bootDate);
   writers.daily.seedLastKeyFromFile(bootDate);
   writers.ticks.seed(bootDate);
+  log.info("boot: monotonic high-water mark seeded; in-progress-bar resume intentionally unsupported (partial minute forfeited on crash)");
 
   let lastPrice6 = 150n * 10n ** 6n; // boot default 150.0 USDC/SOL (plan §3.3)
   let shutdown = false;
   let pollInFlight = false;
 
   const aggregator = new OhlcAggregator({
-    onMinuteBar: (bar) => writeMinuteBar(bar),
+    onMinuteBar: (bar) => void writeMinuteBar(bar),
     onDailyBar: (bar) => void writeDailyBar(bar),
     onDiscarded: (count, reason) => log.warn("ticks discarded (monotonic guard)", { count, reason }),
   });
 
-  function barFromRow(fields: string[], bucketStart: number): Bar | null {
-    if (fields.length < 7 || fields[1] === "") return null;
-    return {
-      bucketStart,
-      open: fields[1] ?? "",
-      high: fields[2] ?? "",
-      low: fields[3] ?? "",
-      close: fields[4] ?? "",
-      sellClose: fields[5] ?? "",
-      ticks: 0, // tick count restarts on resume (documented, plan §4)
-    };
-  }
-
-  {
-    const row = readLastRow(`${cfg.CSV_DIR}/ohlc-1m-${bootDate}.csv`);
-    if (row && row[0] === bootMinuteBucket) {
-      const bar = barFromRow(row, floorTsToMinute(bootTs));
-      if (bar) {
-        aggregator.resumeMinute(bar);
-        log.info("resumed in-progress minute bar", { ts: row[0] });
-      }
-    }
-  }
-  {
-    const row = readLastRow(`${cfg.CSV_DIR}/ohlc-1d.csv`);
-    if (row && row[0] === bootDate) {
-      const bar = barFromRow(row, floorTsToDay(bootTs));
-      if (bar) {
-        aggregator.resumeDaily(bar);
-        log.info("resumed in-progress daily bar", { date: bootDate });
-      }
-    }
-  }
-
-  function writeMinuteBar(bar: Bar): void {
+  async function writeMinuteBar(bar: Bar): Promise<void> {
     const ts = formatMinuteBucket(bar.bucketStart);
     writers.minute.append(formatUtcDate(bar.bucketStart), ts, [
       ts,
@@ -125,6 +94,7 @@ async function main(): Promise<void> {
       bar.sellClose,
       String(bar.ticks),
     ]);
+    await writers.minute.drain(); // flush per bar, like daily bars (review round 1)
   }
 
   async function writeDailyBar(bar: Bar): Promise<void> {
@@ -165,10 +135,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  // --- Poll loop (plan §3.4): jittered, staggered, non-stacking --------------
-  function jitteredInterval(): number {
-    return cfg.POLL_INTERVAL_MS + Math.floor(Math.random() * (2 * JITTER_MS + 1)) - JITTER_MS;
-  }
+  // --- Poll loop (plan §3.4): jittered, staggered, cadence-anchored ---------
+  // Cadence is anchored (review round 1): tick N is scheduled at
+  // anchor + POLL_INTERVAL_MS ± jitter, independent of how long the previous
+  // cycle took, so buy-side samples land every ~5s. pollInFlight skip +
+  // Math.max(0, …) handle slow cycles without stacking.
+  let nextTickAt = 0;
 
   async function pollCycle(): Promise<void> {
     // Buy side: SOL→USDC
@@ -187,12 +159,18 @@ async function main(): Promise<void> {
     if (sell && !shutdown) ingest(sell);
   }
 
-  function scheduleNext(delayMs: number): void {
+  function scheduleNext(anchor: number): void {
     if (shutdown) return;
+    nextTickAt = anchor + cfg.POLL_INTERVAL_MS + Math.floor(Math.random() * (2 * JITTER_MS + 1)) - JITTER_MS;
+    const delayMs = Math.max(0, nextTickAt - Date.now());
     setTimeout(() => {
       void (async () => {
-        if (shutdown || pollInFlight) {
-          scheduleNext(jitteredInterval());
+        if (shutdown) return;
+        if (pollInFlight) {
+          log.warn("poll cycle still in flight — skipping this tick slot", {
+            slot: new Date(nextTickAt).toISOString(),
+          });
+          scheduleNext(nextTickAt);
           return;
         }
         pollInFlight = true;
@@ -209,7 +187,9 @@ async function main(): Promise<void> {
         } finally {
           pollInFlight = false;
           flushGapWarnings();
-          if (!shutdown) scheduleNext(jitteredInterval());
+          // Anchor the next slot on this slot's scheduled time, not cycle
+          // completion, so the 5s cadence holds even for slow cycles.
+          if (!shutdown) scheduleNext(nextTickAt);
         }
       })();
     }, delayMs);
@@ -221,7 +201,7 @@ async function main(): Promise<void> {
     flushGapWarnings();
   }, ROLLOVER_TIMER_MS);
 
-  scheduleNext(jitteredInterval());
+  scheduleNext(Date.now());
 
   // --- Graceful shutdown (plan §7) -------------------------------------------
   let stopping = false;

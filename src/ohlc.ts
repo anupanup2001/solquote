@@ -87,19 +87,12 @@ export class OhlcAggregator {
 
   constructor(private readonly events: AggregatorEvents) {}
 
-  /** Restore in-progress state after restart (plan §4 recovery). */
-  resumeMinute(bar: Bar): void {
-    this.minuteBar = bar;
-  }
-
-  resumeDaily(bar: Bar): void {
-    this.dailyBar = bar;
-  }
-
   /**
    * Ingest a tick. Completed bars are delivered via events.
-   * Ticks at or before the last emitted minute bucket are discarded
-   * (monotonic guard, plan §4).
+   * Monotonic guard (plan §4): discard ticks whose bucket is at or before
+   * the last emitted minute bucket, or before the currently open bar's
+   * bucket (covers an open bar that has not been emitted yet — e.g. a
+   * backward clock step within the same minute).
    */
   push(tick: Tick): void {
     const bucket = floorTsToMinute(tick.ts);
@@ -108,6 +101,13 @@ export class OhlcAggregator {
       this.events.onDiscarded?.(
         1,
         `tick bucket ${formatMinuteBucket(bucket)} <= last emitted ${formatMinuteBucket(this.lastEmittedMinute)}`,
+      );
+      return;
+    }
+    if (this.minuteBar && bucket < this.minuteBar.bucketStart) {
+      this.events.onDiscarded?.(
+        1,
+        `tick bucket ${formatMinuteBucket(bucket)} < open bar ${formatMinuteBucket(this.minuteBar.bucketStart)}`,
       );
       return;
     }

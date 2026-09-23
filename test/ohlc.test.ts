@@ -117,26 +117,17 @@ describe("OhlcAggregator", () => {
     expect(minuteBars).toHaveLength(1);
   });
 
-  it("resumeMinute extends the in-progress bar", () => {
-    const { agg, minuteBars } = harness();
-    agg.resumeMinute({
-      bucketStart: M0,
-      open: "148.000000",
-      high: "148.200000",
-      low: "147.900000",
-      close: "148.000000",
-      sellClose: "148.050000",
-      ticks: 0,
-    });
-    agg.push(buy(T0 + 10_000, "148.400000"));
-    agg.push(sell(T0 + 11_000, "148.410000"));
+  it("monotonic guard discards ticks whose bucket is before the open bar (backward clock step)", () => {
+    const { agg, minuteBars, discarded } = harness();
+    agg.push(buy(T0, "148.100000")); // 14:07 bar open, not yet emitted
+    agg.push(buy(T0 - 10_000, "147.000000")); // 14:06 tick while 14:07 bar open
+    expect(discarded).toHaveLength(1);
+    expect(discarded[0]!.reason).toContain("< open bar");
+    // open bar untouched by the stale tick
+    agg.push(buy(T0 + 10_000, "148.300000"));
     agg.emitDue(M1);
     expect(minuteBars).toHaveLength(1);
-    const bar = minuteBars[0]!;
-    expect(bar.open).toBe("148.000000");
-    expect(bar.high).toBe("148.400000");
-    expect(bar.low).toBe("147.900000");
-    expect(bar.close).toBe("148.400000");
-    expect(bar.sellClose).toBe("148.410000");
+    expect(minuteBars[0]!.low).toBe("148.100000");
+    expect(minuteBars[0]!.ticks).toBe(2); // T0 + T0+10s only; stale tick discarded
   });
 });

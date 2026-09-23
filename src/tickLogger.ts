@@ -14,7 +14,9 @@ export class TickLogger {
     this.writer = new CsvWriter(dir, {
       fileNameFor: (date) => `ticks-${date}.csv`,
       header: HEADER,
-      keyOf: (fields) => fields[0] ?? "",
+      // Key is epoch-ms: 13-digit ms timestamps sort lexicographically the
+      // same as chronologically until year 2286 (when they go 14-digit).
+      keyOf: (fields) => String(Date.parse(fields[0] ?? "")),
     });
   }
 
