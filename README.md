@@ -37,14 +37,14 @@ npm run dev
 
 **`ohlc-1m-YYYY-MM-DD.csv`** — 1-minute bars, rotates at UTC midnight:
 ```
-ts,open,high,low,close,sell_close,ticks
-2026-09-23T14:07:00Z,148.123456,148.201001,148.099002,148.177443,148.189112,12
+ts,buy_open,buy_high,buy_low,buy_close,buy_ticks,sell_open,sell_high,sell_low,sell_close,sell_ticks
+2026-09-23T14:07:00Z,148.190112,148.210001,148.180002,148.190112,12,148.123456,148.201001,148.099002,148.177443,12
 ```
 
-**`ohlc-1d.csv`** — one row per UTC day, appended:
+**`ohlc-1d.csv`** — one row per UTC day, appended (same columns as the 1-min file):
 ```
-date,open,high,low,close,sell_close,ticks
-2026-09-23,147.950100,149.002345,147.801002,148.677443,148.701002,276
+date,buy_open,buy_high,buy_low,buy_close,buy_ticks,sell_open,sell_high,sell_low,sell_close,sell_ticks
+2026-09-23,147.960100,149.012345,147.811002,148.687443,276,147.950100,149.002345,147.801002,148.677443,276
 ```
 
 **`ticks-YYYY-MM-DD.csv`** — raw quote provenance (both directions):
@@ -53,10 +53,14 @@ ts,direction,inAmount,outAmount,price,priceImpact,router,feeBps,inUsdValue,outUs
 ```
 
 Notes:
-- `open/high/low/close` track the **buy** series (SOL→USDC); `sell_close` is the last USDC→SOL price in the bucket (empty if none).
+- Each bar carries **two complete per-side candles**: `buy_*` tracks the **USDC_TO_SOL** series (the executable price when buying SOL) and `sell_*` tracks the **SOL_TO_USDC** series (the executable price when selling SOL). Both are normalized USDC-per-SOL. Use `buy_*` for buy decisions, `sell_*` for sell decisions, and both together for spread / round-trip math.
+- A side with zero ticks in a bucket carries empty OHLC strings and `*_ticks = 0` (the zero tick count is the validity flag). A bar is emitted when at least one side has ticks. Buy/sell closes come from each side's own last tick — they are **not** time-paired; for cross-side comparisons at coarse granularities, pair via tick timestamps (reconstructable exactly from the tick CSV).
 - Minutes/days with zero successful ticks produce **no row** (honest gaps).
 - Prices are fixed 6-decimal strings, truncated (never rounded).
+- Quote prices are already net of route fees and price impact (`feeBps`/`priceImpact` recorded per tick); backtests should add only an explicit execution buffer, not a blanket fees+slippage term.
+- Quote notional differs per side (0.1 SOL for SOL_TO_USDC; ~0.1 SOL USD-equivalent for USDC_TO_SOL, clamped [5, 1000] USDC) and price impact is size-dependent.
 - **Restarts**: in-progress-bar resume is intentionally unsupported — a crash mid-minute forfeits that partial minute's OHLC row (raw tick CSV keeps provenance); restarts never duplicate already-persisted rows (monotonic high-water mark).
+- **Schema guard**: the writer refuses (throws `CsvHeaderMismatchError`) to append to an existing file whose header doesn't match the expected one. Old-schema bar files are archived under `data/archive-v1/` (regenerable from `ticks-*.csv`).
 
 ## Health
 

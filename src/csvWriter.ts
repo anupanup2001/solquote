@@ -7,9 +7,36 @@
  * - monotonic guard: refuses rows whose key <= the last written key
  * - flush per row via explicit `drain()` (callers flush bars promptly)
  */
-import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
+import {
+  closeSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { finished } from "node:stream/promises";
 import type { WriteStream } from "node:fs";
+
+/**
+ * Thrown when an existing CSV file's header line does not match the writer's
+ * expected header (schema drift — e.g. appending new-schema rows under an
+ * old header would corrupt the file silently). Fail fast instead.
+ */
+export class CsvHeaderMismatchError extends Error {
+  constructor(
+    public readonly path: string,
+    public readonly expected: string,
+    public readonly actual: string,
+  ) {
+    super(
+      `CSV header mismatch in ${path}: expected "${expected}" but file starts with "${actual}" — ` +
+        `archive the old file (e.g. rename to *.v1.csv) or regenerate it before appending`,
+    );
+    this.name = "CsvHeaderMismatchError";
+  }
+}
 
 export interface CsvWriterOptions {
   /** File name builder, e.g. (date) => `ohlc-1m-${date}.csv`. */
@@ -76,6 +103,7 @@ export class CsvWriter {
       this.stream = null;
     }
     const path = `${this.dir}/${this.opts.fileNameFor(date)}`;
+    assertHeaderMatches(path, this.opts.header);
     const isNew = !existsSync(path) || statSync(path).size === 0;
     this.stream = createWriteStream(path, { flags: "a" });
     if (isNew) {
@@ -93,7 +121,7 @@ export class CsvWriter {
   /** Seed the monotonic guard from an existing file's last row (recovery). */
   seedLastKeyFromFile(date: string): void {
     const path = `${this.dir}/${this.opts.fileNameFor(date)}`;
-    if (!existsSync(path)) return;
+    assertHeaderMatches(path, this.opts.header);
     const last = readLastRow(path);
     if (last) {
       this.lastKey = this.opts.keyOf(last);
@@ -102,6 +130,37 @@ export class CsvWriter {
 
   get lastWrittenKey(): string | null {
     return this.lastKey;
+  }
+}
+
+/**
+ * Fail fast when an existing, non-empty CSV file's first line is not the
+ * expected header. Appending new-schema rows under an old header would
+ * corrupt the file silently (the monotonic guard still keys on fields[0]),
+ * so a mismatch throws instead of appending.
+ */
+function assertHeaderMatches(path: string, expectedHeader: string): void {
+  if (!existsSync(path)) return;
+  const st = statSync(path);
+  if (!st.isFile() || st.size === 0) return;
+  const first = readFirstLine(path);
+  if (first !== null && first !== expectedHeader) {
+    throw new CsvHeaderMismatchError(path, expectedHeader, first);
+  }
+}
+
+/** Read the first line of a file (without its newline), or null if empty. */
+function readFirstLine(path: string): string | null {
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(4096);
+    const read = readSync(fd, buf, 0, buf.length, 0);
+    const text = buf.toString("utf8", 0, read);
+    const nl = text.indexOf("\n");
+    const first = nl === -1 ? text : text.slice(0, nl);
+    return first.length > 0 ? first : null;
+  } finally {
+    closeSync(fd);
   }
 }
 

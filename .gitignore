@@ -4,3 +4,4 @@ data/*.csv
 .env
 *.log
 .pi/
+data/archive-v1/

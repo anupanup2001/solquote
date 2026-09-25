@@ -146,9 +146,10 @@ export class JupiterClient {
     }
     const inAmount = body.inAmount;
     const outAmount = body.outAmount;
-    // SOL→USDC: price = out(USDC 6dp)/in(lamports) × 10^(9−6).
-    // USDC→SOL: price = in(USDC 6dp)/out(lamports) × 10^(9−6) — in/out of the
-    // response, because the response's input is USDC and output is SOL.
+    // Sell side (SOL_TO_USDC): price = out(USDC 6dp)/in(lamports) × 10^(9−6).
+    // Buy side (USDC_TO_SOL): price = in(USDC 6dp)/out(lamports) × 10^(9−6) —
+    // in/out of the response, because the response's input is USDC and output
+    // is SOL. Both are the executable USDC-per-SOL price for that direction.
     const price =
       direction === "SOL_TO_USDC"
         ? priceUsdPerSol(outAmount, inAmount)

@@ -25,8 +25,28 @@ const JITTER_MS = 250;
 const ROLLOVER_TIMER_MS = 1_000;
 const SELL_STAGGER_MS = 2_500;
 
-const MINUTE_HEADER = "ts,open,high,low,close,sell_close,ticks";
-const DAILY_HEADER = "date,open,high,low,close,sell_close,ticks";
+// Dual per-side candles (plan §5, amended): buy_* = USDC_TO_SOL series,
+// sell_* = SOL_TO_USDC series. Both are normalized USDC-per-SOL.
+const MINUTE_HEADER =
+  "ts,buy_open,buy_high,buy_low,buy_close,buy_ticks,sell_open,sell_high,sell_low,sell_close,sell_ticks";
+const DAILY_HEADER =
+  "date,buy_open,buy_high,buy_low,buy_close,buy_ticks,sell_open,sell_high,sell_low,sell_close,sell_ticks";
+
+function barRowFields(key: string, bar: Bar): string[] {
+  return [
+    key,
+    bar.buy.open,
+    bar.buy.high,
+    bar.buy.low,
+    bar.buy.close,
+    String(bar.buy.ticks),
+    bar.sell.open,
+    bar.sell.high,
+    bar.sell.low,
+    bar.sell.close,
+    String(bar.sell.ticks),
+  ];
+}
 
 interface Writers {
   minute: CsvWriter;
@@ -85,30 +105,18 @@ async function main(): Promise<void> {
 
   async function writeMinuteBar(bar: Bar): Promise<void> {
     const ts = formatMinuteBucket(bar.bucketStart);
-    const ok = writers.minute.append(formatUtcDate(bar.bucketStart), ts, [
+    const ok = writers.minute.append(
+      formatUtcDate(bar.bucketStart),
       ts,
-      bar.open,
-      bar.high,
-      bar.low,
-      bar.close,
-      bar.sellClose,
-      String(bar.ticks),
-    ]);
+      barRowFields(ts, bar),
+    );
     if (!ok) log.warn("minute bar refused by monotonic guard — row dropped", { ts });
     await writers.minute.drain(); // flush per bar, like daily bars (review round 1)
   }
 
   async function writeDailyBar(bar: Bar): Promise<void> {
     const date = formatUtcDate(bar.bucketStart);
-    const ok = writers.daily.append(date, date, [
-      date,
-      bar.open,
-      bar.high,
-      bar.low,
-      bar.close,
-      bar.sellClose,
-      String(bar.ticks),
-    ]);
+    const ok = writers.daily.append(date, date, barRowFields(date, bar));
     if (!ok) log.warn("daily bar refused by monotonic guard — row dropped", { date });
     await writers.daily.drain();
   }
@@ -152,20 +160,23 @@ async function main(): Promise<void> {
   let nextTickAt = 0;
 
   async function pollCycle(): Promise<void> {
-    // Buy side: SOL→USDC
-    const buy = await client.getQuote("SOL_TO_USDC", BigInt(cfg.QUOTE_SOL_LAMPORTS));
-    if (buy && !shutdown) {
-      ingest(buy);
-      lastPrice6 = parseFixed6(buy.price);
+    // Sell side first (SOL→USDC): the executable price when selling SOL.
+    const sellQuote = await client.getQuote("SOL_TO_USDC", BigInt(cfg.QUOTE_SOL_LAMPORTS));
+    if (sellQuote && !shutdown) {
+      ingest(sellQuote);
+      // Sizing refresh (plan §3.3): lastPrice6 comes ONLY from the
+      // SOL_TO_USDC quote — never from USDC_TO_SOL — to avoid a feedback
+      // loop. Keep this source even after the buy/sellQuote renames.
+      lastPrice6 = parseFixed6(sellQuote.price);
     }
     if (shutdown) return;
 
-    // Sell side: USDC→SOL, staggered +2.5s, sized ~0.1 SOL notional (plan §3.3).
+    // Buy side (USDC→SOL), staggered +2.5s, sized ~0.1 SOL notional (plan §3.3).
     await sleep(SELL_STAGGER_MS);
     if (shutdown) return;
     const amount = sellUsdcAmount(lastPrice6, BigInt(cfg.QUOTE_SOL_LAMPORTS));
-    const sell = await client.getQuote("USDC_TO_SOL", amount);
-    if (sell && !shutdown) ingest(sell);
+    const buyQuote = await client.getQuote("USDC_TO_SOL", amount);
+    if (buyQuote && !shutdown) ingest(buyQuote);
   }
 
   function scheduleNext(anchor: number): void {
