@@ -3,8 +3,10 @@
  * No I/O, no clocks — all time comes from tick timestamps or the `now`
  * argument passed to `emitDue()`, keeping the module trivially testable.
  *
- * Series semantics (plan §4): the OHLC core tracks the buyPrice series
- * (SOL→USDC). Sell ticks only update `sell_close`.
+ * Series semantics (plan §4, amended): each bar carries TWO complete
+ * per-side candles — `buy` tracks the USDC_TO_SOL series (the executable
+ * price when buying SOL) and `sell` tracks the SOL_TO_USDC series (the
+ * executable price when selling SOL). Both are normalized USDC-per-SOL.
  */
 
 export type Direction = "SOL_TO_USDC" | "USDC_TO_SOL";
@@ -17,17 +19,22 @@ export interface Tick {
   price: string;
 }
 
-export interface Bar {
-  /** bucket start, epoch ms (minute or day) */
-  bucketStart: number;
+export interface SideBar {
   open: string;
   high: string;
   low: string;
   close: string;
-  /** last sell price in bucket; empty string if no sell tick */
-  sellClose: string;
-  /** count of buy-direction ticks in bucket */
+  /** count of this side's ticks in the bucket (0 when the side had none) */
   ticks: number;
+}
+
+export interface Bar {
+  /** bucket start, epoch ms (minute or day) */
+  bucketStart: number;
+  /** USDC_TO_SOL series — the executable price for buying SOL */
+  buy: SideBar;
+  /** SOL_TO_USDC series — the executable price for selling SOL */
+  sell: SideBar;
 }
 
 const MINUTE_MS = 60_000;
@@ -75,8 +82,12 @@ export interface AggregatorEvents {
   onDiscarded?: (count: number, reason: string) => void;
 }
 
+function newSideBar(): SideBar {
+  return { open: "", high: "", low: "", close: "", ticks: 0 };
+}
+
 function newBar(bucketStart: number): Bar {
-  return { bucketStart, open: "", high: "", low: "", close: "", sellClose: "", ticks: 0 };
+  return { bucketStart, buy: newSideBar(), sell: newSideBar() };
 }
 
 export class OhlcAggregator {
@@ -173,19 +184,16 @@ export class OhlcAggregator {
   }
 
   private applyToBar(bar: Bar, tick: Tick): void {
-    if (tick.direction === "SOL_TO_USDC") {
-      if (bar.open === "") {
-        bar.open = tick.price;
-        bar.high = tick.price;
-        bar.low = tick.price;
-      } else {
-        if (comparePrices(tick.price, bar.high) > 0) bar.high = tick.price;
-        if (comparePrices(tick.price, bar.low) < 0) bar.low = tick.price;
-      }
-      bar.close = tick.price;
-      bar.ticks += 1;
+    const side = tick.direction === "USDC_TO_SOL" ? bar.buy : bar.sell;
+    if (side.open === "") {
+      side.open = tick.price;
+      side.high = tick.price;
+      side.low = tick.price;
     } else {
-      bar.sellClose = tick.price;
+      if (comparePrices(tick.price, side.high) > 0) side.high = tick.price;
+      if (comparePrices(tick.price, side.low) < 0) side.low = tick.price;
     }
+    side.close = tick.price;
+    side.ticks += 1;
   }
 }

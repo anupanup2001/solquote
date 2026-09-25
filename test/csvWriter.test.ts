@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CsvWriter, readLastRow } from "../src/csvWriter.js";
+import { CsvWriter, CsvHeaderMismatchError, readLastRow } from "../src/csvWriter.js";
 
 describe("CsvWriter", () => {
   let dir: string;
@@ -64,6 +64,29 @@ describe("CsvWriter", () => {
     await w.drain();
     await w.close();
     expect(readFileSync(join(dir, "pre.csv"), "utf8")).toBe("ts,value\nx1,5\nx2,9\nx3,11\n");
+  });
+
+  it("refuses an existing file whose header differs from the expected header", () => {
+    // Old-schema file: appending new-schema rows under this header would
+    // silently corrupt it, so seeding must fail fast.
+    writeFileSync(join(dir, "stale.csv"), "ts,open,high,low,close,sell_close,ticks\nx1,1,1,1,1,1,1\n");
+    const w = writerFor(() => "stale.csv");
+    expect(() => w.seedLastKeyFromFile("2026-09-23")).toThrow(CsvHeaderMismatchError);
+  });
+
+  it("refuses to rotate into an existing file with a mismatched header", () => {
+    writeFileSync(join(dir, "ohlc-1m-2026-09-24.csv"), "ts,open,high,low,close,sell_close,ticks\n");
+    const w = writerFor((date) => `ohlc-1m-${date}.csv`);
+    expect(() => w.append("2026-09-24", "t1", ["t1", "1"])).toThrow(CsvHeaderMismatchError);
+  });
+
+  it("tolerates an existing empty file (header written on first append)", async () => {
+    writeFileSync(join(dir, "empty.csv"), "");
+    const w = writerFor(() => "empty.csv");
+    expect(w.append("2026-09-23", "t1", ["t1", "1"])).toBe(true);
+    await w.drain();
+    await w.close();
+    expect(readFileSync(join(dir, "empty.csv"), "utf8")).toBe("ts,value\nt1,1\n");
   });
 });
 

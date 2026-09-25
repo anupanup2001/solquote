@@ -5,7 +5,7 @@ Headless TypeScript service that polls the Jupiter Swap API V2 every 5 seconds f
 ## 1. Overview
 
 ### Goals
-- Poll Jupiter Swap API V2 (`GET /swap/v2/order`, quote-only mode) every 5 s in **both directions**: SOL→USDC (buy price) and USDC→SOL (sell price).
+- Poll Jupiter Swap API V2 (`GET /swap/v2/order`, quote-only mode) every 5 s in **both directions**: USDC→SOL (buy-side price — executable when buying SOL) and SOL→USDC (sell-side price — executable when selling SOL).
 - Aggregate ticks into **1-minute OHLC bars** (file rotates daily at UTC midnight) and **daily OHLC bars** (single appended file), UTC everywhere.
 - Write provenance-rich **raw tick CSV** (one row per successful quote, both directions).
 - Flush per bar, handle gaps honestly (no synthetic rows); in-progress-bar resume intentionally unsupported (crash mid-minute forfeits that partial minute — gap semantics, tick CSV keeps provenance).
@@ -25,7 +25,7 @@ Headless TypeScript service that polls the Jupiter Swap API V2 every 5 seconds f
 | 3 | ISO-8601 UTC timestamps in CSVs |
 | 4 | Flat layout: all CSVs in one mounted dir (`CSV_DIR=/app/data`) |
 | 5 | Minute with zero successful ticks → **no row** (honest gap), warn log |
-| 6 | Floor tick ts to UTC minute; open=first tick, close=last, high/low=max/min; daily rows keyed by UTC date |
+| 6 | ~~Single OHLC core + `sell_close`~~ **AMENDED 2026-09-25**: dual per-side candles — `buy_*` (USDC→SOL) and `sell_*` (SOL→USDC) OHLC columns in one file (see §4/§5). Supersedes the original single-series rationale; old-schema bar files archived under `data/archive-v1/` |
 | 7 | Swap quotes only |
 | 8 | HTTP health endpoint on port 8080 for Docker HEALTHCHECK |
 | 9 | Minimal vitest tests (aggregator + CSV writer only), bare `tsc --strict`, no linter |
@@ -82,18 +82,18 @@ Do **not** set `slippageBps` — Jupiter auto-determines; response echoes the us
 ### 3.2 Price derivation (BigInt-safe)
 `inAmount`/`outAmount` are strings in base units. Parse with `BigInt`, never `Number`:
 ```
-buyPrice  (SOL→USDC) = outAmount / inAmount × 10^(9−6) = outAmount / inAmount × 1000   // USDC per SOL
-sellPrice (USDC→SOL) = inAmount / outAmount × 10^(9−6) = inAmount / outAmount × 1000    // USDC per SOL
+sellPrice (SOL_TO_USDC) = outAmount / inAmount × 10^(9−6) = outAmount / inAmount × 1000   // executable USDC per SOL when selling SOL
+buyPrice  (USDC_TO_SOL) = inAmount / outAmount × 10^(9−6) = inAmount / outAmount × 1000    // executable USDC per SOL when buying SOL
 ```
 Compute as `(a * 10n**18n) / b` scaled then format to a decimal string with 6 fractional digits (price precision of 1e-6 USDC per SOL is ample). Emit as plain decimal string in CSV to avoid float artifacts.
 
 Also carried per tick: `priceImpact` (percentage points, e.g. `-0.1` = −0.1%), `router`, `feeBps` — provenance only, not used in OHLC math.
 
-### 3.3 USDC→SOL quote sizing (decision 2)
+### 3.3 USDC→SOL (buy-side) quote sizing (decision 2)
 To keep both sides near 0.1 SOL notional:
-- Maintain `lastPrice` = most recent buyPrice (boot default: **150.0** USDC/SOL).
+- Maintain `lastPrice` = most recent **sellPrice** (SOL→USDC quote; boot default: **150.0** USDC/SOL).
 - `usdcAmount = round(0.1 SOL × lastPrice × 10^6)` base units, clamped to [5, 1000] USDC. The 5 USDC floor preserves USD-equivalence at current SOL prices (0.1 SOL ≈ $15 at SOL=$150); the clamp only binds at extremes (> $10,000 SOL). Sell notional therefore tracks ~0.1 SOL worth, per the locked decision.
-- Refresh `lastPrice` from every successful SOL→USDC quote (ignore sellPrice for sizing to avoid feedback loops).
+- Refresh `lastPrice` from every successful SOL→USDC quote (ignore buyPrice for sizing to avoid feedback loops). This source is intentional and must stay even after the buy/sellQuote identifier renames.
 - This is one line of state, deterministic, and avoids `Quote size drift` compounding (see §10).
 
 ### 3.4 Rate-limit / retry policy (Free tier = 1 RPS, 60 s sliding window, per org)
@@ -111,11 +111,12 @@ Before the loop starts: one real SOL→USDC quote. Log the derived price. Any no
 ## 4. OHLC aggregation rules
 
 - **Bucket key**: `floorTsToMinute(tsUTC)` → `YYYY-MM-DDTHH:MM:00Z`; daily key = `YYYY-MM-DD`.
-- Each successful tick updates the current bar: `high = max`, `low = min`, `close = price`, `ticks += 1`; first tick sets `open`.
-- **Series**: the OHLC core (`open/high/low/close`) tracks the **buyPrice series (SOL→USDC)**. The sellPrice series is recorded as a single `sell_close` column = close of the sell-side ticks within the same bucket (empty string if the sell direction had no tick that bucket). Rationale: backtesting a swap algorithm needs both an executable buy and sell estimate, but two full OHLC columns quadruple columns for little value — sell-side intra-minute volatility on this pair is within noise of buy-side; the raw tick file preserves full fidelity if it's ever needed.
+- Each successful tick updates the current bar's side candle: `high = max`, `low = min`, `close = price`, `ticks += 1`; first tick sets `open`.
+- **Series (amended 2026-09-25, supersedes the original single-series rationale)**: each bar carries **two complete per-side candles** — `buy_*` tracks the **USDC_TO_SOL** series (the executable price when buying SOL) and `sell_*` tracks the **SOL_TO_USDC** series (the executable price when selling SOL); both are normalized USDC-per-SOL. A bar is emitted when at least one side has ticks; a side with zero ticks carries empty OHLC strings and `ticks = 0` (the zero tick count is the validity flag — no separate column). Buckets with zero ticks in **both** directions still produce no row (locked decision 5, unchanged). Rationale: buy decisions should be made on buy-side candles and sell decisions on sell-side candles; a single-candle-plus-`sell_close` design discards the reverse side's intra-minute OHLC. Raw tick file unchanged (full fidelity, rebuild/validate source).
 - **Rollover (timer-driven, primary)**: a 1-second wall-clock timer (`setInterval`, 1 s) checks whether the current minute bucket has changed; when it has (or when the UTC date rolls over), it emits the current bar(s) to the writer. Tick-driven rollover remains as a fallback (if a tick with a newer bucket arrives first, the bar is emitted then). Rationale: emission must not depend on the *next* tick arriving — if the API goes down at 14:07:30, the 14:07 bar (already holding real ticks) is still flushed within ≤1 s instead of being lost forever. Same timer closes the daily bar at 00:00:00Z.
 - **Gaps**: buckets with zero successful ticks produce **no CSV row** (locked decision 5). A warn is logged with the number of skipped minutes. Same semantics for the daily file (a fully-down day produces no row).
 - **Rotation**: 1-min writer rotates when the bar's UTC date changes → close current file, open `ohlc-1m-<newDate>.csv`, write header if file is new.
+- **Schema guard**: at boot seeding and at every rotation, the writer checks an existing file's first line against the expected header and throws `CsvHeaderMismatchError` on mismatch (fail fast instead of silently appending new-schema rows under an old header). Old-schema bar files are archived (e.g. `data/archive-v1/`), never appended to; the raw tick CSV can regenerate them in the new schema if needed.
 - **Restart behavior (no in-progress resume — owner decision, review round 1)**:
   On boot, writers seed their monotonic high-water mark from the last existing row's `ts`/`date` (cheap: last ~4 KB via `readLastRow`) purely so an append can **never duplicate** a row already persisted before the restart. One boot log line states that in-progress-bar resume is intentionally unsupported.
   - **Loss window**: fully-elapsed minutes are on disk within ~1 s of their close (timer emission), so a crash at most forfeits the *current partial minute's* OHLC row (≤1 min of bar data, matching gap semantics — no synthetic backfill). Raw tick CSV keeps full provenance for the forfeited minute.
@@ -130,15 +131,15 @@ All in `CSV_DIR` (flat, locked decision 4). UTF-8, LF newlines, header always wr
 
 **`ohlc-1m-YYYY-MM-DD.csv`** (rotates at UTC midnight)
 ```
-ts,open,high,low,close,sell_close,ticks
-2026-09-23T14:07:00Z,148.123456,148.201001,148.099002,148.177443,148.189112,12
+ts,buy_open,buy_high,buy_low,buy_close,buy_ticks,sell_open,sell_high,sell_low,sell_close,sell_ticks
+2026-09-23T14:07:00Z,148.190112,148.210001,148.180002,148.190112,12,148.123456,148.201001,148.099002,148.177443,12
 ```
-- `ts` = minute bucket start, ISO-8601 UTC. `open/high/low/close` = buyPrice series. `sell_close` = last sellPrice in bucket (empty if none). `ticks` = successful buy-direction ticks in bucket.
+- `ts` = minute bucket start, ISO-8601 UTC. `buy_*` = USDC_TO_SOL series (executable price for buying SOL); `sell_*` = SOL_TO_USDC series (executable price for selling SOL). Each side: `open`=first tick, `close`=last tick, `high`/`low` = max/min; `*_ticks` = that side's tick count (0 + empty OHLC strings when the side had no ticks that bucket). A side's close comes from that side's own last tick — buy/sell closes are NOT time-paired; at coarse granularities pair them via tick timestamps (reconstructable exactly from `ticks-*.csv`) or restrict cross-side comparisons to 1-min bars.
 
-**`ohlc-1d.csv`** (single file, appended forever)
+**`ohlc-1d.csv`** (single file, appended forever) — same columns as the 1-min file, keyed by UTC date:
 ```
-date,open,high,low,close,sell_close,ticks
-2026-09-23,147.950100,149.002345,147.801002,148.677443,148.701002,276
+date,buy_open,buy_high,buy_low,buy_close,buy_ticks,sell_open,sell_high,sell_low,sell_close,sell_ticks
+2026-09-23,147.960100,149.012345,147.811002,148.687443,276,147.950100,149.002345,147.801002,148.677443,276
 ```
 
 **`ticks-YYYY-MM-DD.csv`** (raw provenance, rotates daily)
@@ -148,7 +149,11 @@ ts,direction,inAmount,outAmount,price,priceImpact,router,feeBps,inUsdValue,outUs
 ```
 - `direction` ∈ {`SOL_TO_USDC`,`USDC_TO_SOL`}; `price` normalized USDC-per-SOL decimal string; `ts` full ISO with milliseconds; `inUsdValue`/`outUsdValue` captured from the API response as a free cross-check of the price math.
 
-Numeric formatting: prices as fixed 6-decimal decimal strings (truncate, never round, so tests are deterministic); `ticks` integer; `priceImpact` as returned (number→string). No quoting needed (no commas in fields).
+Numeric formatting: prices as fixed 6-decimal decimal strings (truncate, never round, so tests are deterministic); `*_ticks` integers; `priceImpact` as returned (number→string). No quoting needed (no commas in fields).
+
+**Analysis notes (for downstream backtests)**
+- Buy signals use `buy_*` candles; sell signals use `sell_*` candles. Both are executable quote prices, already net of route fees and price impact (per-tick `feeBps`/`priceImpact` are recorded in the tick file). Round-trip profitability therefore compares `future sell_close / current buy_close > 1 + execution buffer + required profit`, where the execution buffer covers network fees and adverse movement between quote and execution — do NOT add a blanket fees+slippage term on top of the recorded prices (double counting).
+- Quote notional differs per side (0.1 SOL for SOL_TO_USDC; ~0.1 SOL USD-equivalent for USDC_TO_SOL, clamped [5, 1000] USDC) and price impact is size-dependent — candles are comparable only to executions of similar notional.
 
 ## 6. Project layout, dependencies, config
 
@@ -237,7 +242,7 @@ The poll loop checks the shutdown flag between phases (buy → stagger → sell)
 1. First tick opens a bar; subsequent ticks update high/low/close/ticks.
 2. Tick in next minute → emits completed bar and opens new one.
 3. Gap minute (no ticks spanning 2 minutes) → no bar emitted for the gap, next bar opens from the late tick.
-4. `sell_close` recorded from sell-direction ticks; empty when none.
+4. Per-side candles: each direction keeps its own OHLC; a side with no ticks carries empty OHLC and `ticks = 0`.
 5. UTC floor correctness across a day boundary (23:59→00:00Z) → daily bar emitted.
 
 **`test/csvWriter.test.ts`** (tmp dir):
@@ -261,7 +266,7 @@ Run: `npm test`. Everything else validated by the startup smoke test + `docker c
 
 ## 10. Risks & open items
 
-- **Quote-size drift (USDC→SOL)**: sizing derives from `lastPrice`; a stale price after long API outages could skew the sell quote size. Mitigation: clamp (§3.3) + size is cosmetic for price math (price = in/out ratio; exact `amount` barely moves the marginal price on this deep pair).
+- **Quote-size drift (USDC→SOL, buy side)**: sizing derives from `lastPrice`; a stale price after long API outages could skew the buy quote size. Mitigation: clamp (§3.3) + size is cosmetic for price math (price = in/out ratio; exact `amount` barely moves the marginal price on this deep pair).
 - **Free-tier 1 RPS ceiling**: our average is 0.4 RPS but retries after failures could burst; backoff cap + skip-tick policy keeps us under. If limits tighten, paid Developer tier ($25/mo, 10 RPS) is the fallback — same code, header already sent.
 - **Long-run file growth**: `ohlc-1d.csv` grows ~365 rows/yr — fine. `ticks-*.csv` ~34.5k rows/day ≈ 3–4 MB/day; acceptable, but add "open item": optional tick-log retention/compression later.
 - **Clock skew**: timestamps are host UTC; if host clock skews, buckets skew. Docker containers inherit host clock; acceptable. Use `Date.now()`, not response headers.
